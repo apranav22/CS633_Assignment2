@@ -5,11 +5,12 @@
 #include <math.h>
 #include <float.h>
 
-// ! i dont think we are allowed to use MPI_Sendrecv. Instead we can use MPI_Isend and MPI_Irecv with MPI_Waitall to achieve the same effect. 
+// Neighbor ranks for this process in the 3D process grid.
 typedef struct {
     int west, east, south, north, back, front;
 } ProcessGrid;
 
+// Halo storage for boundary slabs exchanged with neighboring processes.
 typedef struct {
     int radius;
     int nx, ny, nz;
@@ -31,6 +32,7 @@ int rank_from_coords(int x, int y, int z, int py, int pz) {
 }
 
 void setup_process_grid(ProcessGrid *grid, int rank, int px, int py, int pz) {
+    // Convert the flat MPI rank into (x, y, z), with z varying fastest.
     int x = rank / (py * pz);
     int y = (rank / pz) % py;
     int z = rank % pz;
@@ -92,6 +94,7 @@ void free_halos(HaloBuffers *halo) {
 }
 
 void set_halo_neighbors(HaloBuffers *halo, ProcessGrid *grid) {
+    // MPI_PROC_NULL marks a global boundary with no neighboring process.
     halo->west_neighbor_exists = grid->west != MPI_PROC_NULL;
     halo->east_neighbor_exists = grid->east != MPI_PROC_NULL;
     halo->south_neighbor_exists = grid->south != MPI_PROC_NULL;
@@ -136,8 +139,10 @@ void pack_z(double *field, double *buffer, int start_z, HaloBuffers *halo) {
     }
 }
 
+// Exchange the boundary slabs needed for stencil reads that cross process edges.
 void exchange_halos(double *field, ProcessGrid *grid, HaloBuffers *halo) {
-    MPI_Status status;
+    MPI_Request reqs[12];
+    int req_count = 0;
 
     memset(halo->west, 0, (size_t)halo->x_count * sizeof *halo->west);
     memset(halo->east, 0, (size_t)halo->x_count * sizeof *halo->east);
@@ -148,34 +153,52 @@ void exchange_halos(double *field, ProcessGrid *grid, HaloBuffers *halo) {
 
     pack_x(field, halo->send_west, 0, halo);
     pack_x(field, halo->send_east, halo->nx - halo->radius, halo);
-    MPI_Sendrecv(halo->send_west, halo->x_count, MPI_DOUBLE, grid->west, 0,
-                 halo->east, halo->x_count, MPI_DOUBLE, grid->east, 0, MPI_COMM_WORLD, &status);
-    MPI_Sendrecv(halo->send_east, halo->x_count, MPI_DOUBLE, grid->east, 1,
-                 halo->west, halo->x_count, MPI_DOUBLE, grid->west, 1, MPI_COMM_WORLD, &status);
-
     pack_y(field, halo->send_south, 0, halo);
     pack_y(field, halo->send_north, halo->ny - halo->radius, halo);
-    MPI_Sendrecv(halo->send_south, halo->y_count, MPI_DOUBLE, grid->south, 2,
-                 halo->north, halo->y_count, MPI_DOUBLE, grid->north, 2, MPI_COMM_WORLD, &status);
-    MPI_Sendrecv(halo->send_north, halo->y_count, MPI_DOUBLE, grid->north, 3,
-                 halo->south, halo->y_count, MPI_DOUBLE, grid->south, 3, MPI_COMM_WORLD, &status);
-
     pack_z(field, halo->send_back, 0, halo);
     pack_z(field, halo->send_front, halo->nz - halo->radius, halo);
-    MPI_Sendrecv(halo->send_back, halo->z_count, MPI_DOUBLE, grid->back, 4,
-                 halo->front, halo->z_count, MPI_DOUBLE, grid->front, 4, MPI_COMM_WORLD, &status);
-    MPI_Sendrecv(halo->send_front, halo->z_count, MPI_DOUBLE, grid->front, 5,
-                 halo->back, halo->z_count, MPI_DOUBLE, grid->back, 5, MPI_COMM_WORLD, &status);
+
+    // Post receives before sends so each neighbor has a matching receive ready.
+    if (grid->west != MPI_PROC_NULL)
+        MPI_Irecv(halo->west, halo->x_count, MPI_DOUBLE, grid->west, 1, MPI_COMM_WORLD, &reqs[req_count++]);
+    if (grid->east != MPI_PROC_NULL)
+        MPI_Irecv(halo->east, halo->x_count, MPI_DOUBLE, grid->east, 0, MPI_COMM_WORLD, &reqs[req_count++]);
+    if (grid->south != MPI_PROC_NULL)
+        MPI_Irecv(halo->south, halo->y_count, MPI_DOUBLE, grid->south, 3, MPI_COMM_WORLD, &reqs[req_count++]);
+    if (grid->north != MPI_PROC_NULL)
+        MPI_Irecv(halo->north, halo->y_count, MPI_DOUBLE, grid->north, 2, MPI_COMM_WORLD, &reqs[req_count++]);
+    if (grid->back != MPI_PROC_NULL)
+        MPI_Irecv(halo->back, halo->z_count, MPI_DOUBLE, grid->back, 5, MPI_COMM_WORLD, &reqs[req_count++]);
+    if (grid->front != MPI_PROC_NULL)
+        MPI_Irecv(halo->front, halo->z_count, MPI_DOUBLE, grid->front, 4, MPI_COMM_WORLD, &reqs[req_count++]);
+
+    // Send this process's boundary slabs to the adjacent processes.
+    if (grid->west != MPI_PROC_NULL)
+        MPI_Isend(halo->send_west, halo->x_count, MPI_DOUBLE, grid->west, 0, MPI_COMM_WORLD, &reqs[req_count++]);
+    if (grid->east != MPI_PROC_NULL)
+        MPI_Isend(halo->send_east, halo->x_count, MPI_DOUBLE, grid->east, 1, MPI_COMM_WORLD, &reqs[req_count++]);
+    if (grid->south != MPI_PROC_NULL)
+        MPI_Isend(halo->send_south, halo->y_count, MPI_DOUBLE, grid->south, 2, MPI_COMM_WORLD, &reqs[req_count++]);
+    if (grid->north != MPI_PROC_NULL)
+        MPI_Isend(halo->send_north, halo->y_count, MPI_DOUBLE, grid->north, 3, MPI_COMM_WORLD, &reqs[req_count++]);
+    if (grid->back != MPI_PROC_NULL)
+        MPI_Isend(halo->send_back, halo->z_count, MPI_DOUBLE, grid->back, 4, MPI_COMM_WORLD, &reqs[req_count++]);
+    if (grid->front != MPI_PROC_NULL)
+        MPI_Isend(halo->send_front, halo->z_count, MPI_DOUBLE, grid->front, 5, MPI_COMM_WORLD, &reqs[req_count++]);
+
+    if (req_count > 0) {
+        MPI_Waitall(req_count, reqs, MPI_STATUSES_IGNORE);
+    }
 }
 
 double halo_value(double *buffer, int layer, int a, int b, int dim_a, int dim_b) {
     return buffer[(layer * dim_a + a) * dim_b + b];
 }
 
-void d_point_stencil(double *current, double *next, int nx, int ny, int nz, int d,
-                     HaloBuffers *halo) {
+void d_point_stencil(double *current, double *next, int nx, int ny, int nz, int d, HaloBuffers *halo) {
     int radius = (d - 1) / 6;
 
+    // Average the center point with radius layers along the six axis directions.
     for (int x = 0; x < nx; x++) {
         for (int y = 0; y < ny; y++) {
             for (int z = 0; z < nz; z++) {
@@ -245,6 +268,7 @@ long long count_isovalue_cells(double *field, int nx, int ny, int nz, double iso
     for (int x = 0; x < nx - 1; x++) {
         for (int y = 0; y < ny - 1; y++) {
             for (int z = 0; z < nz - 1; z++) {
+                // Values at the 8 corners of the cell with lower corner (x, y, z).
                 double v0 = field[index3d(x, y, z, ny, nz)];
                 double v1 = field[index3d(x + 1, y, z, ny, nz)];
                 double v2 = field[index3d(x, y + 1, z, ny, nz)];
@@ -253,6 +277,7 @@ long long count_isovalue_cells(double *field, int nx, int ny, int nz, double iso
                 double v5 = field[index3d(x + 1, y, z + 1, ny, nz)];
                 double v6 = field[index3d(x, y + 1, z + 1, ny, nz)];
                 double v7 = field[index3d(x + 1, y + 1, z + 1, ny, nz)];
+                
                 double min_value = v0;
                 double max_value = v0;
 
@@ -356,13 +381,13 @@ int main(int argc, char *argv[]) {
 
     setup_process_grid(&grid, rank, px, py, pz);
 
-    
     data = malloc((size_t)F * sizeof *data);
     next = malloc((size_t)F * sizeof *next);
     data_storage = malloc((size_t)F * arrSize * sizeof *data_storage);
     next_storage = malloc((size_t)F * arrSize * sizeof *next_storage);
     local_counts = calloc((size_t)F, sizeof *local_counts);
     global_counts = calloc((size_t)F * T, sizeof *global_counts);
+    
     if (data == NULL || next == NULL || data_storage == NULL || next_storage == NULL ||
         local_counts == NULL || global_counts == NULL ||
         !allocate_halos(&halo, radius, nx, ny, nz)) {
@@ -377,6 +402,7 @@ int main(int argc, char *argv[]) {
         MPI_Finalize();
         return EXIT_FAILURE;
     }
+    
     set_halo_neighbors(&halo, &grid);
 
     for (int i = 0; i < F; i++) {
@@ -414,13 +440,12 @@ int main(int argc, char *argv[]) {
 
     MPI_Reduce(&local_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
+    // Rank 0 prints per-field counts for each timestep, followed by total runtime.
     if (rank == 0) {
         for (int t = 0; t < T; t++) {
             for (int i = 0; i < F; i++) {
                 printf("%lld", global_counts[(size_t)t * F + i]);
-                if (i < F - 1) {
-                    printf(" ");
-                }
+                if (i < F - 1) printf(" ");
             }
             printf("\n");
         }
@@ -436,6 +461,5 @@ int main(int argc, char *argv[]) {
     free_halos(&halo);
 
     MPI_Finalize();
-    
     return 0;
 }
