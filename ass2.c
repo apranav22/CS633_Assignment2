@@ -27,22 +27,23 @@ int index3d(int x, int y, int z, int ny, int nz) {
     return (x * ny + y) * nz + z;
 }
 
-int rank_from_coords(int x, int y, int z, int py, int pz) {
-    return (x * py + y) * pz + z;
+int rank_from_coords(int x, int y, int z, int px, int py) {
+    // x varies fastest, then y, then z — matches sanskaar.c's layout.
+    return (z * py + y) * px + x;
 }
 
 void setup_process_grid(ProcessGrid *grid, int rank, int px, int py, int pz) {
-    // Convert the flat MPI rank into (x, y, z), with z varying fastest.
-    int x = rank / (py * pz);
-    int y = (rank / pz) % py;
-    int z = rank % pz;
+    // Convert the flat MPI rank into (x, y, z), with x varying fastest.
+    int x = rank % px;
+    int y = (rank / px) % py;
+    int z = rank / (px * py);
 
-    grid->west = (x > 0) ? rank_from_coords(x - 1, y, z, py, pz) : MPI_PROC_NULL;
-    grid->east = (x < px - 1) ? rank_from_coords(x + 1, y, z, py, pz) : MPI_PROC_NULL;
-    grid->south = (y > 0) ? rank_from_coords(x, y - 1, z, py, pz) : MPI_PROC_NULL;
-    grid->north = (y < py - 1) ? rank_from_coords(x, y + 1, z, py, pz) : MPI_PROC_NULL;
-    grid->back = (z > 0) ? rank_from_coords(x, y, z - 1, py, pz) : MPI_PROC_NULL;
-    grid->front = (z < pz - 1) ? rank_from_coords(x, y, z + 1, py, pz) : MPI_PROC_NULL;
+    grid->west = (x > 0) ? rank_from_coords(x - 1, y, z, px, py) : MPI_PROC_NULL;
+    grid->east = (x < px - 1) ? rank_from_coords(x + 1, y, z, px, py) : MPI_PROC_NULL;
+    grid->south = (y > 0) ? rank_from_coords(x, y - 1, z, px, py) : MPI_PROC_NULL;
+    grid->north = (y < py - 1) ? rank_from_coords(x, y + 1, z, px, py) : MPI_PROC_NULL;
+    grid->back = (z > 0) ? rank_from_coords(x, y, z - 1, px, py) : MPI_PROC_NULL;
+    grid->front = (z < pz - 1) ? rank_from_coords(x, y, z + 1, px, py) : MPI_PROC_NULL;
 }
 
 int allocate_halos(HaloBuffers *halo, int radius, int nx, int ny, int nz) {
@@ -424,9 +425,9 @@ int main(int argc, char *argv[]) {
     
     set_halo_neighbors(&halo, &grid);
 
-    rank_x = rank / (py * pz);
-    rank_y = (rank / pz) % py;
-    rank_z = rank % pz;
+    rank_x = rank % px;
+    rank_y = (rank / px) % py;
+    rank_z = rank / (px * py);
     gx_off = rank_x * nx;
     gy_off = rank_y * ny;
     gz_off = rank_z * nz;
@@ -439,10 +440,17 @@ int main(int argc, char *argv[]) {
         next[i] = next_storage + (size_t)i * arrSize;
     }
 
+    // Iterate in x-fastest order (z slowest → y → x fastest) to match sanskaar.c's
+    // initialization, so the j-th rand() call is assigned to the same (x,y,z) cell.
     srand(seed);
     for (int i = 0; i < F; i++) {
         for (int j = 0; j < arrSize; j++) {
-            data[i][j] = (double)rand() * (rank + 1) / (110426.0 + i + j);
+            int z_loc = j / (ny * nx);
+            int rem   = j % (ny * nx);
+            int y_loc = rem / nx;
+            int x_loc = rem % nx;
+            data[i][index3d(x_loc, y_loc, z_loc, ny, nz)] =
+                (double)rand() * (rank + 1) / (110426.0 + i + j);
         }
     }
 
