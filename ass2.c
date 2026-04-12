@@ -205,7 +205,7 @@ void d_point_stencil(double *current, double *next, int nx, int ny, int nz, int 
                 int index = index3d(x, y, z, ny, nz);
                 double sum = current[index];
                 int neighbor_count = 1;
-
+    
                 for (int distance = 1; distance <= radius; distance++) {
                     if (x >= distance) {
                         sum += current[index3d(x - distance, y, z, ny, nz)];
@@ -262,43 +262,60 @@ void d_point_stencil(double *current, double *next, int nx, int ny, int nz, int 
     }
 }
 
-long long count_isovalue_cells(double *field, int nx, int ny, int nz, double isovalue) {
+// Count cells where the isovalue surface crosses an edge between adjacent cells.
+// Uses global coordinates (gx_off + x, etc.) to detect global-domain boundaries,
+// and reads halo buffers for neighbor values that cross process boundaries.
+long long count_isovalue_cells(double *field, int nx, int ny, int nz, double isovalue,
+                                HaloBuffers *halo,
+                                int gx_off, int gy_off, int gz_off,
+                                int gx_max, int gy_max, int gz_max) {
     long long isovalue_count = 0;
+    int radius = halo->radius;
 
-    for (int x = 0; x < nx - 1; x++) {
-        for (int y = 0; y < ny - 1; y++) {
-            for (int z = 0; z < nz - 1; z++) {
-                // Values at the 8 corners of the cell with lower corner (x, y, z).
-                double v0 = field[index3d(x, y, z, ny, nz)];
-                double v1 = field[index3d(x + 1, y, z, ny, nz)];
-                double v2 = field[index3d(x, y + 1, z, ny, nz)];
-                double v3 = field[index3d(x + 1, y + 1, z, ny, nz)];
-                double v4 = field[index3d(x, y, z + 1, ny, nz)];
-                double v5 = field[index3d(x + 1, y, z + 1, ny, nz)];
-                double v6 = field[index3d(x, y + 1, z + 1, ny, nz)];
-                double v7 = field[index3d(x + 1, y + 1, z + 1, ny, nz)];
-                
-                double min_value = v0;
-                double max_value = v0;
+    for (int x = 0; x < nx; x++) {
+        int gx = gx_off + x;
+        for (int y = 0; y < ny; y++) {
+            int gy = gy_off + y;
+            for (int z = 0; z < nz; z++) {
+                int gz = gz_off + z;
+                double center = field[index3d(x, y, z, ny, nz)]; // 
+                double v;
 
-                if (v1 < min_value) min_value = v1;
-                if (v2 < min_value) min_value = v2;
-                if (v3 < min_value) min_value = v3;
-                if (v4 < min_value) min_value = v4;
-                if (v5 < min_value) min_value = v5;
-                if (v6 < min_value) min_value = v6;
-                if (v7 < min_value) min_value = v7;
-
-                if (v1 > max_value) max_value = v1;
-                if (v2 > max_value) max_value = v2;
-                if (v3 > max_value) max_value = v3;
-                if (v4 > max_value) max_value = v4;
-                if (v5 > max_value) max_value = v5;
-                if (v6 > max_value) max_value = v6;
-                if (v7 > max_value) max_value = v7;
-
-                if (min_value <= isovalue && isovalue <= max_value) {
-                    isovalue_count++;
+                if (gx - 1 >= 0) {
+                    v = (x - 1 >= 0) ? field[index3d(x-1, y, z, ny, nz)]
+                                     : halo_value(halo->west, radius - 1, y, z, ny, nz);
+                    if ((center <= isovalue && v > isovalue) || (center > isovalue && v <= isovalue))
+                        isovalue_count++;
+                }
+                if (gx + 1 < gx_max) {
+                    v = (x + 1 < nx) ? field[index3d(x+1, y, z, ny, nz)]
+                                     : halo_value(halo->east, 0, y, z, ny, nz);
+                    if ((center <= isovalue && v > isovalue) || (center > isovalue && v <= isovalue))
+                        isovalue_count++;
+                }
+                if (gy - 1 >= 0) {
+                    v = (y - 1 >= 0) ? field[index3d(x, y-1, z, ny, nz)]
+                                     : halo_value(halo->south, radius - 1, x, z, nx, nz);
+                    if ((center <= isovalue && v > isovalue) || (center > isovalue && v <= isovalue))
+                        isovalue_count++;
+                }
+                if (gy + 1 < gy_max) {
+                    v = (y + 1 < ny) ? field[index3d(x, y+1, z, ny, nz)]
+                                     : halo_value(halo->north, 0, x, z, nx, nz);
+                    if ((center <= isovalue && v > isovalue) || (center > isovalue && v <= isovalue))
+                        isovalue_count++;
+                }
+                if (gz - 1 >= 0) {
+                    v = (z - 1 >= 0) ? field[index3d(x, y, z-1, ny, nz)]
+                                     : halo_value(halo->back, radius - 1, x, y, nx, ny);
+                    if ((center <= isovalue && v > isovalue) || (center > isovalue && v <= isovalue))
+                        isovalue_count++;
+                }
+                if (gz + 1 < gz_max) {
+                    v = (z + 1 < nz) ? field[index3d(x, y, z+1, ny, nz)]
+                                     : halo_value(halo->front, 0, x, y, nx, ny);
+                    if ((center <= isovalue && v > isovalue) || (center > isovalue && v <= isovalue))
+                        isovalue_count++;
                 }
             }
         }
@@ -319,6 +336,8 @@ int main(int argc, char *argv[]) {
     double *next_storage;
     long long *local_counts;
     long long *global_counts;
+    int rank_x, rank_y, rank_z;
+    int gx_off, gy_off, gz_off, gx_max, gy_max, gz_max;
     double start_time;
     double end_time;
     double local_time;
@@ -386,7 +405,7 @@ int main(int argc, char *argv[]) {
     data_storage = malloc((size_t)F * arrSize * sizeof *data_storage);
     next_storage = malloc((size_t)F * arrSize * sizeof *next_storage);
     local_counts = calloc((size_t)F, sizeof *local_counts);
-    global_counts = calloc((size_t)F * T, sizeof *global_counts);
+    global_counts = calloc((size_t)F, sizeof *global_counts);
     
     if (data == NULL || next == NULL || data_storage == NULL || next_storage == NULL ||
         local_counts == NULL || global_counts == NULL ||
@@ -404,6 +423,16 @@ int main(int argc, char *argv[]) {
     }
     
     set_halo_neighbors(&halo, &grid);
+
+    rank_x = rank / (py * pz);
+    rank_y = (rank / pz) % py;
+    rank_z = rank % pz;
+    gx_off = rank_x * nx;
+    gy_off = rank_y * ny;
+    gz_off = rank_z * nz;
+    gx_max = px * nx;
+    gy_max = py * ny;
+    gz_max = pz * nz;
 
     for (int i = 0; i < F; i++) {
         data[i] = data_storage + (size_t)i * arrSize;
@@ -423,11 +452,24 @@ int main(int argc, char *argv[]) {
     for (int t = 0; t < T; t++) {
         for (int i = 0; i < F; i++) {
             exchange_halos(data[i], &grid, &halo);
+            // Count isovalue crossings on the current field (with halos filled) before
+            // applying the stencil, matching the logic in sanskaar.c.
+            local_counts[i] = count_isovalue_cells(data[i], nx, ny, nz, isovalue,
+                                                    &halo,
+                                                    gx_off, gy_off, gz_off,
+                                                    gx_max, gy_max, gz_max);
             d_point_stencil(data[i], next[i], nx, ny, nz, d, &halo);
-            local_counts[i] = count_isovalue_cells(next[i], nx, ny, nz, isovalue);
         }
 
-        MPI_Reduce(local_counts, global_counts + (size_t)t * F, F, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(local_counts, global_counts, F, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+        if (rank == 0) {
+            for (int i = 0; i < F; i++) {
+                printf("%lld", global_counts[i]);
+                if (i < F - 1) printf(" ");
+            }
+            printf("\n");
+        }
 
         double **temp = data;
         data = next;
@@ -440,16 +482,8 @@ int main(int argc, char *argv[]) {
 
     MPI_Reduce(&local_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    // Rank 0 prints per-field counts for each timestep, followed by total runtime.
     if (rank == 0) {
-        for (int t = 0; t < T; t++) {
-            for (int i = 0; i < F; i++) {
-                printf("%lld", global_counts[(size_t)t * F + i]);
-                if (i < F - 1) printf(" ");
-            }
-            printf("\n");
-        }
-        printf("%f\n", max_time);
+        printf("%.6f\n", max_time);
     }
 
     free(global_counts);
@@ -462,4 +496,4 @@ int main(int argc, char *argv[]) {
 
     MPI_Finalize();
     return 0;
-}
+    }
